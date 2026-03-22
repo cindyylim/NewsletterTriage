@@ -1,0 +1,28 @@
+{
+  "sources": [
+    {
+      "name": "Ben's Bites (AI)",
+      "url": "https://www.bensbites.com/feed",
+      "niche": "AI"
+    },
+    {
+      "name": "JavaScript Weekly",
+      "url": "https://javascriptweekly.com/rss/",
+      "niche": "JavaScript"
+    },
+    {
+      "name": "CSS Weekly",
+      "url": "https://css-weekly.com/feed",
+      "niche": "CSS"
+    },
+    {
+      "name": "PyCoder's Weekly",
+      "url": "https://pycoders.com/feed",
+      "niche": "Python"
+    }
+  ],
+  "settings": {
+    "max_entries_per_run": 1,
+    "summary_length": "medium"
+  }
+}
