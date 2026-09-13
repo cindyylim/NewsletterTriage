@@ -1,25 +1,113 @@
-# Newsletter Triage System
+# Newsletter Triage
 
-An automated, dependency-free Python script to scrape newsletters (via RSS), summarize them using AI, and deliver the results to Telegram.
+Hourly digest of industry newsletters, delivered as short Telegram briefs.
+
+A cron-ready Python job that pulls RSS/Atom feeds, skips already-seen items, summarizes new ones with Gemini, and posts niche-tagged takeaways to Telegram. **Python 3 standard library only — no `pip install`.**
+
+`Python 3` · `stdlib HTTP/XML` · `Gemini API` · `Telegram Bot API` · `cron`
+
+## Problem
+
+Newsletter volume is high; signal is not. This job replaces inbox skimming with a capped, deduped brief: one new item per source per run, focused on practical takeaways for a configured niche (AI, JavaScript, Python, CSS).
+
+## Pipeline
+
+```mermaid
+flowchart LR
+  A[config.json sources] --> B[Fetch RSS / Atom]
+  B --> C[Parse + strip HTML]
+  C --> D{Seen link?}
+  D -->|yes| E[Skip]
+  D -->|no| F[Gemini summary]
+  F --> G[Escape + format HTML]
+  G --> H[Telegram]
+  H --> I[processed_entries.json]
+```
+
+Missing API keys put the same path into **dry-run**: fetch and format still run; Gemini and Telegram are skipped and nothing is persisted. Useful for verifying feeds before wiring secrets.
+
+## Design choices
+
+These are the parts a reviewer should look at in [`main.py`](main.py).
+
+| Decision | Why it matters |
+|---|---|
+| **Stdlib only** | `urllib`, `xml.etree`, `json`, `re`. No `requests` / `feedparser` lock-in; easy to drop on a VPS or cron host. |
+| **RSS 2.0 and Atom** | Real feeds are mixed. Parser looks up `item` and namespaced `entry`, including Atom `link href`. |
+| **308 redirect follow** | `urlopen` handles 301/302; several newsletter hosts return 308. Relative `Location` is resolved against the original origin. |
+| **Idempotent reruns** | Seen URLs live in `processed_entries.json`. Cron can fire every hour without re-sending the same issue. |
+| **Per-source cap** | `max_entries_per_run` bounds Gemini spend and Telegram noise. Default in config is 1. |
+| **429 backoff** | Gemini calls retry with exponential delay (`5s`, `7s`, `11s`) plus a 5s pause between items. |
+| **Dry-run without secrets** | Pipeline is testable from a clone; side effects require all three env vars. |
+| **Telegram-safe HTML** | Title and model output are escaped, then `**bold**` and list markers are converted. Avoids broken `parse_mode` from raw model markdown. |
+| **Secrets stay out of git** | `.env` and the processed-id store are gitignored. [`.env.example`](.env.example) documents the contract. |
 
 ## Setup
 
-1. **Configure Sources**: Edit `config.json` to add your favorite newsletter RSS feeds and define their niche categories.
-2. **Environment Variables**:
-   - Copy `.env.example` to `.env`.
-   - Add your `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
-   - Add your `GEMINI_API_KEY` for AI summarization.
-3. **Run a Dry Run**: Run `python3 main.py` without a `.env` file to see if the scraping works as expected.
+```bash
+git clone <this-repo>
+cd NewsletterTriage
+cp .env.example .env
+```
 
-## Automation (Cron)
+Fill in `.env`:
 
-To run this automatically every hour, add it to your crontab:
+| Variable | Purpose |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | Bot from [@BotFather](https://t.me/BotFather) |
+| `TELEGRAM_CHAT_ID` | Destination chat (user, group, or channel the bot can post to) |
+| `GEMINI_API_KEY` | [Google AI Studio](https://aistudio.google.com/apikey) |
 
-1. Open crontab:
-   ```bash
-   crontab -e
-   ```
-2. Add the following line (adjust paths):
-   ```bash
-   0 * * * * cd /Users/c/.gemini/antigravity/scratch/newsletter-triage && /usr/bin/python3 main.py >> triage.log 2>&1
-   ```
+Confirm feeds without spending tokens:
+
+```bash
+# omit .env, or leave keys empty
+python3 main.py
+```
+
+Live run:
+
+```bash
+python3 main.py
+```
+
+## Configuration
+
+Sources and budget live in [`config.json`](config.json), not in code:
+
+```json
+{
+  "sources": [
+    { "name": "JavaScript Weekly", "url": "https://javascriptweekly.com/rss/", "niche": "JavaScript" }
+  ],
+  "settings": {
+    "max_entries_per_run": 1,
+    "summary_length": "medium"
+  }
+}
+```
+
+`niche` is injected into the Gemini prompt so summaries stay role-specific. Add or remove feeds by editing the array.
+
+## Operations
+
+Hourly cron (adjust the working directory):
+
+```cron
+0 * * * * cd /path/to/NewsletterTriage && /usr/bin/python3 main.py >> triage.log 2>&1
+```
+
+State file: `processed_entries.json` (created on the first successful live run). Delete it to reprocess history. Logs are stdout/stderr only — redirect as above.
+
+## Layout
+
+```
+NewsletterTriage/
+├── main.py                 # fetch → parse → summarize → send
+├── config.json             # feeds + per-run cap
+├── .env.example            # required secrets
+├── processed_entries.json  # local idempotency store (not committed)
+└── README.md
+```
+
+Single module, explicit I/O, no framework. The interesting code is the HTTP edge cases, the dry-run split, and the retry/dedupe path — not the file count.
