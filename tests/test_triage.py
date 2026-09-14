@@ -47,6 +47,33 @@ ATOM_MIXED_XML = b"""<?xml version="1.0"?>
 </feed>
 """
 
+ATOM_NESTED_XML = b"""<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <title>Nested</title>
+    <link href="https://example.com/nested"/>
+    <summary>Takeaways for <em>Python</em> readers.</summary>
+  </entry>
+</feed>
+"""
+
+TWO_ITEM_RSS = b"""<?xml version="1.0"?>
+<rss version="2.0">
+  <channel>
+    <item>
+      <title>First</title>
+      <link>https://example.com/one</link>
+      <description>one</description>
+    </item>
+    <item>
+      <title>Second</title>
+      <link>https://example.com/two</link>
+      <description>two</description>
+    </item>
+  </channel>
+</rss>
+"""
+
 
 def http_error(url, code, reason, location=None):
     headers = EmailMessage()
@@ -81,6 +108,10 @@ class ParseRssTests(unittest.TestCase):
     def test_skips_atom_entry_without_link_and_keeps_the_rest(self):
         entries = main.parse_rss(ATOM_MIXED_XML)
         self.assertEqual([entry['link'] for entry in entries], ['https://example.com/kept'])
+
+    def test_itertext_keeps_nested_markup_text(self):
+        entries = main.parse_rss(ATOM_NESTED_XML)
+        self.assertEqual(entries[0]['summary'], 'Takeaways for Python readers.')
 
     def test_invalid_xml_returns_empty_list(self):
         self.assertEqual(main.parse_rss(b'not xml'), [])
@@ -147,17 +178,43 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(source['niche'])
         self.assertIsInstance(config['settings']['max_entries_per_run'], int)
         self.assertIn(config['settings']['summary_length'], main.SUMMARY_LENGTH_HINTS)
+        self.assertEqual(main.validate_config(config), [])
 
 
 class EnvTests(unittest.TestCase):
     def test_load_env_sets_values_from_file(self):
         previous = os.environ.pop('TELEGRAM_CHAT_ID', None)
+        leaked = os.environ.pop('SHOULD_NOT_EXIST', None)
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 env_path = Path(tmp) / '.env'
-                env_path.write_text('TELEGRAM_CHAT_ID=12345\n# comment\n', encoding='utf-8')
+                env_path.write_text(
+                    'TELEGRAM_CHAT_ID=12345\n# SHOULD_NOT_EXIST=nope\nexport UNUSED_TRIAGE=1\n',
+                    encoding='utf-8',
+                )
                 main.load_env(env_path)
                 self.assertEqual(os.environ['TELEGRAM_CHAT_ID'], '12345')
+                self.assertNotIn('SHOULD_NOT_EXIST', os.environ)
+        finally:
+            os.environ.pop('UNUSED_TRIAGE', None)
+            if leaked is None:
+                os.environ.pop('SHOULD_NOT_EXIST', None)
+            else:
+                os.environ['SHOULD_NOT_EXIST'] = leaked
+            if previous is None:
+                os.environ.pop('TELEGRAM_CHAT_ID', None)
+            else:
+                os.environ['TELEGRAM_CHAT_ID'] = previous
+
+    def test_load_env_does_not_override_existing(self):
+        previous = os.environ.get('TELEGRAM_CHAT_ID')
+        os.environ['TELEGRAM_CHAT_ID'] = 'keep-me'
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                env_path = Path(tmp) / '.env'
+                env_path.write_text('TELEGRAM_CHAT_ID=from-file\n', encoding='utf-8')
+                main.load_env(env_path)
+                self.assertEqual(os.environ['TELEGRAM_CHAT_ID'], 'keep-me')
         finally:
             if previous is None:
                 os.environ.pop('TELEGRAM_CHAT_ID', None)
@@ -185,6 +242,13 @@ class ProcessedStoreTests(unittest.TestCase):
                 handle.write('{not-json')
             self.assertEqual(main.load_processed(path), set())
 
+    def test_save_processed_replaces_without_leaving_tmp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'processed_entries.json'
+            main.save_processed({'b', 'a'}, path)
+            self.assertEqual(main.load_processed(path), {'a', 'b'})
+            self.assertFalse(path.with_name(path.name + '.tmp').exists())
+
 
 class FetchRssTests(unittest.TestCase):
     def test_returns_none_on_network_error(self):
@@ -209,6 +273,24 @@ class FetchRssTests(unittest.TestCase):
         self.assertEqual(body, RSS_XML)
         second_request = urlopen.call_args_list[1].args[0]
         self.assertEqual(second_request.full_url, 'https://example.com/rss/')
+        self.assertEqual(second_request.get_header('User-agent'), main.USER_AGENT)
+
+    def test_follows_relative_308_via_urljoin(self):
+        redirect = http_error(
+            'https://example.com/feed/index', 308, 'Permanent Redirect', 'rss.xml'
+        )
+        try:
+            with patch(
+                'urllib.request.urlopen', side_effect=[redirect, mock_response()]
+            ) as urlopen:
+                body = main.fetch_rss('https://example.com/feed/index')
+        finally:
+            redirect.close()
+        self.assertEqual(body, RSS_XML)
+        self.assertEqual(
+            urlopen.call_args_list[1].args[0].full_url,
+            'https://example.com/feed/rss.xml',
+        )
 
     def test_308_hop_limit_returns_none(self):
         errors = [
@@ -260,6 +342,24 @@ class GeminiTests(unittest.TestCase):
         headers = {key.lower(): value for key, value in request.header_items()}
         self.assertEqual(headers.get('x-goog-api-key'), 'fake-key')
         self.assertEqual(urlopen.call_args.kwargs['timeout'], main.HTTP_TIMEOUT)
+
+    def test_retries_on_503(self):
+        unavailable = http_error(
+            'https://generativelanguage.googleapis.com', 503, 'Service Unavailable'
+        )
+        payload = json.dumps({
+            'candidates': [{'content': {'parts': [{'text': 'recovered'}]}}]
+        }).encode('utf-8')
+        try:
+            with patch('main.time.sleep'):
+                with patch(
+                    'urllib.request.urlopen',
+                    side_effect=[unavailable, mock_response(payload)],
+                ):
+                    text = main.call_gemini('fake-key', 'summarize this')
+        finally:
+            unavailable.close()
+        self.assertEqual(text, 'recovered')
 
 
 class PipelineTests(unittest.TestCase):
@@ -320,7 +420,7 @@ class PipelineTests(unittest.TestCase):
         telegram.assert_not_called()
         sleep.assert_not_called()
 
-    def test_failed_send_does_not_persist(self):
+    def test_failed_send_does_not_persist_and_exits_nonzero(self):
         self.write_config()
         self.set_secrets()
         with patch('main.fetch_rss', return_value=RSS_XML), \
@@ -328,8 +428,46 @@ class PipelineTests(unittest.TestCase):
              patch('main.send_telegram', return_value=None), \
              patch('main.time.sleep'):
             code = main.main([])
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 1)
         self.assertFalse(self.processed_path().exists())
+
+    def test_telegram_ok_false_does_not_persist(self):
+        self.write_config()
+        self.set_secrets()
+        with patch('main.fetch_rss', return_value=RSS_XML), \
+             patch('main.call_gemini', return_value='takeaway'), \
+             patch('main.send_telegram', return_value={'ok': False}), \
+             patch('main.time.sleep'):
+            code = main.main([])
+        self.assertEqual(code, 1)
+        self.assertFalse(self.processed_path().exists())
+
+    def test_gemini_failures_count_toward_cap(self):
+        self.write_config(max_entries=1)
+        self.set_secrets()
+        with patch('main.fetch_rss', return_value=TWO_ITEM_RSS), \
+             patch('main.call_gemini', return_value=None) as gemini, \
+             patch('main.send_telegram') as telegram, \
+             patch('main.time.sleep'):
+            code = main.main([])
+        self.assertEqual(code, 1)
+        self.assertEqual(gemini.call_count, 1)
+        telegram.assert_not_called()
+        self.assertFalse(self.processed_path().exists())
+
+    def test_all_feeds_failing_exits_nonzero(self):
+        self.write_config()
+        self.set_secrets()
+        with patch('main.fetch_rss', return_value=None), \
+             patch('main.time.sleep'):
+            code = main.main([])
+        self.assertEqual(code, 1)
+
+    def test_invalid_config_exits_nonzero(self):
+        with open(main.BASE_DIR / 'config.json', 'w', encoding='utf-8') as handle:
+            json.dump({'sources': []}, handle)
+        self.set_secrets()
+        self.assertEqual(main.main([]), 1)
 
     def test_successful_send_persists_immediately(self):
         self.write_config()
