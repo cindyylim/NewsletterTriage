@@ -24,7 +24,6 @@ flowchart LR
   H --> I[processed_entries.json]
 ```
 
-Missing API keys put the same path into **dry-run**: fetch and format still run; Gemini and Telegram are skipped and nothing is persisted. Useful for verifying feeds before wiring secrets.
 
 ## Design choices
 
@@ -35,10 +34,11 @@ These are the parts a reviewer should look at in [`main.py`](main.py).
 | **Stdlib only** | `urllib`, `xml.etree`, `json`, `re`. No `requests` / `feedparser` lock-in; easy to drop on a VPS or cron host. |
 | **RSS 2.0 and Atom** | Real feeds are mixed. Parser looks up `item` and namespaced `entry`, including Atom `link href`. |
 | **308 redirect follow** | `urlopen` handles 301/302; several newsletter hosts return 308. Relative `Location` is resolved against the original origin. |
-| **Idempotent reruns** | Seen URLs live in `processed_entries.json`. Cron can fire every hour without re-sending the same issue. |
+| **Idempotent reruns** | Seen URLs live in `processed_entries.json`, written after each successful Telegram send. A failed send is left unprocessed and retried next hour. |
 | **Per-source cap** | `max_entries_per_run` bounds Gemini spend and Telegram noise. Default in config is 1. |
-| **429 backoff** | Gemini calls retry with exponential delay (`5s`, `7s`, `11s`) plus a 5s pause between items. |
-| **Dry-run without secrets** | Pipeline is testable from a clone; side effects require all three env vars. |
+| **429 backoff** | Gemini calls retry with exponential delay (`5s`, `7s`, `11s`) plus a 5s pause between items. HTTP calls use a 20s timeout. |
+| **Explicit dry-run** | `--dry-run` scrapes without side effects. Missing secrets without that flag fail the job. |
+| **API key as header** | Gemini auth uses `x-goog-api-key`, not a query string, so keys are less likely to land in logs. |
 | **Telegram-safe HTML** | Title and model output are escaped, then `**bold**` and list markers are converted. Avoids broken `parse_mode` from raw model markdown. |
 | **Secrets stay out of git** | `.env` and the processed-id store are gitignored. [`.env.example`](.env.example) documents the contract. |
 
@@ -61,11 +61,10 @@ Fill in `.env`:
 Confirm feeds without spending tokens:
 
 ```bash
-# omit .env, or leave keys empty
-python3 main.py
+python3 main.py --dry-run
 ```
 
-Live run:
+Live run (requires all three env vars):
 
 ```bash
 python3 main.py
@@ -87,7 +86,7 @@ Sources and budget live in [`config.json`](config.json), not in code:
 }
 ```
 
-`niche` is injected into the Gemini prompt so summaries stay role-specific. Add or remove feeds by editing the array.
+`niche` and `summary_length` (`short` / `medium` / `long`) are injected into the Gemini prompt. Add or remove feeds by editing the array.
 
 ## Operations
 
@@ -107,7 +106,7 @@ Stdlib `unittest` only — CI does not install packages.
 python3 -m unittest discover -s tests -v
 ```
 
-GitHub Actions runs that command on every push and pull request ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)). Tests stay offline: RSS/Atom fixtures, mocked 308/429 HTTP, and a dry-run that must not persist state or call Gemini/Telegram.
+GitHub Actions runs that command on every push and pull request ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)). Tests stay offline: RSS/Atom fixtures, mocked 308/429 HTTP, failed sends that must not persist, and `--dry-run`.
 
 ## Layout
 

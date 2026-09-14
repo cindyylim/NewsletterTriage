@@ -1,2 +1,4 @@
 .env
 processed_entries.json
+/tests/__pycache__
+__pycache__
