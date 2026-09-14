@@ -99,12 +99,24 @@ Hourly cron (adjust the working directory):
 
 State file: `processed_entries.json` (created on the first successful live run). Delete it to reprocess history. Logs are stdout/stderr only — redirect as above.
 
+## Tests
+
+Stdlib `unittest` only — CI does not install packages.
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+GitHub Actions runs that command on every push and pull request ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)). Tests stay offline: RSS/Atom fixtures, mocked 308/429 HTTP, and a dry-run that must not persist state or call Gemini/Telegram.
+
 ## Layout
 
 ```
 NewsletterTriage/
 ├── main.py                 # fetch → parse → summarize → send
 ├── config.json             # feeds + per-run cap
+├── tests/                  # unittest, no third-party deps
+├── .github/workflows/ci.yml
 ├── .env.example            # required secrets
 ├── processed_entries.json  # local idempotency store (not committed)
 └── README.md

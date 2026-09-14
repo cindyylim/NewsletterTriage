@@ -86,6 +86,13 @@ def call_gemini(api_key, prompt, retries=3):
             break
     return None
 
+def format_telegram_message(niche, title, summary, link):
+    html_summary = summary.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    html_summary = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', html_summary)
+    html_summary = re.sub(r'^\s*[\*\-]\s+', '• ', html_summary, flags=re.MULTILINE)
+    safe_title = title.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    return f"<b>[{niche}] {safe_title}</b>\n\n{html_summary}\n\n<a href='{link}'>Read more</a>"
+
 def send_telegram(token, chat_id, message):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     # Switch to HTML mode which is more robust for automatic content
@@ -158,15 +165,9 @@ def main():
                 summary = call_gemini(gemini_key, prompt)
             
             if summary:
-                # Basic Markdown to HTML conversion for Telegram
-                html_summary = summary.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                # Convert bold **text** to <b>text</b>
-                html_summary = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', html_summary)
-                # Convert bullet points * or - at start of lines to •
-                html_summary = re.sub(r'^\s*[\*\-]\s+', '• ', html_summary, flags=re.MULTILINE)
-                
-                safe_title = entry['title'].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                formatted_msg = f"<b>[{source['niche']}] {safe_title}</b>\n\n{html_summary}\n\n<a href='{entry['link']}'>Read more</a>"
+                formatted_msg = format_telegram_message(
+                    source['niche'], entry['title'], summary, entry['link']
+                )
                 
                 if dry_run:
                     print(f"\nFORMATED MESSAGE:\n{formatted_msg}\n")
