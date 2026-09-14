@@ -1,4 +1,5 @@
 import argparse
+import html
 import json
 import os
 import re
@@ -6,10 +7,13 @@ import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 HTTP_TIMEOUT = 20
 MAX_REDIRECTS = 5
-PROCESSED_FILE = 'processed_entries.json'
+ITEM_PAUSE_SECONDS = 5
+TELEGRAM_MAX_LENGTH = 4096
+BASE_DIR = Path(__file__).resolve().parent
 ATOM_NS = '{http://www.w3.org/2005/Atom}'
 REQUIRED_ENV = ('TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID', 'GEMINI_API_KEY')
 SUMMARY_LENGTH_HINTS = {
@@ -19,33 +23,41 @@ SUMMARY_LENGTH_HINTS = {
 }
 
 
-def load_config():
-    with open('config.json', 'r') as f:
+def _data_path(path, name):
+    return Path(path) if path is not None else BASE_DIR / name
+
+
+def load_config(path=None):
+    with open(_data_path(path, 'config.json'), 'r', encoding='utf-8') as f:
         return json.load(f)
 
 
-def load_env():
-    if os.path.exists('.env'):
-        with open('.env', 'r') as f:
-            for line in f:
-                if '=' in line:
-                    key, value = line.strip().split('=', 1)
-                    os.environ[key] = value
+def load_env(path=None):
+    env_path = _data_path(path, '.env')
+    if not env_path.exists():
+        return
+    with open(env_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if '=' in line:
+                key, value = line.strip().split('=', 1)
+                os.environ[key] = value
 
 
-def load_processed(path=PROCESSED_FILE):
-    if not os.path.exists(path):
+def load_processed(path=None):
+    processed_path = _data_path(path, 'processed_entries.json')
+    if not processed_path.exists():
         return set()
     try:
-        with open(path, 'r') as f:
+        with open(processed_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         return set(data)
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return set()
 
 
-def save_processed(processed, path=PROCESSED_FILE):
-    with open(path, 'w') as f:
+def save_processed(processed, path=None):
+    processed_path = _data_path(path, 'processed_entries.json')
+    with open(processed_path, 'w', encoding='utf-8') as f:
         json.dump(sorted(processed), f)
 
 
@@ -159,12 +171,33 @@ def call_gemini(api_key, prompt, retries=3):
     return None
 
 
+def _fit_telegram_text(text, max_len):
+    if max_len <= 0:
+        return ''
+    if len(text) <= max_len:
+        return text
+    if max_len == 1:
+        return '…'
+    cut = text[: max_len - 1]
+    lt = cut.rfind('<')
+    gt = cut.rfind('>')
+    if lt > gt:
+        cut = cut[:lt]
+    return cut.rstrip() + '…'
+
+
 def format_telegram_message(niche, title, summary, link):
-    html_summary = summary.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-    html_summary = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', html_summary)
-    html_summary = re.sub(r'^\s*[\*\-]\s+', '• ', html_summary, flags=re.MULTILINE)
-    safe_title = title.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-    return f"<b>[{niche}] {safe_title}</b>\n\n{html_summary}\n\n<a href='{link}'>Read more</a>"
+    header = f"<b>[{html.escape(niche)}] {html.escape(title)}</b>\n\n"
+    footer = f"\n\n<a href=\"{html.escape(link, quote=True)}\">Read more</a>"
+    body = html.escape(summary)
+    body = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', body)
+    body = re.sub(r'^\s*[\*\-]\s+', '• ', body, flags=re.MULTILINE)
+
+    budget = TELEGRAM_MAX_LENGTH - len(header) - len(footer)
+    if budget < 0:
+        clipped_header = _fit_telegram_text(header, TELEGRAM_MAX_LENGTH - len(footer))
+        return clipped_header + footer
+    return header + _fit_telegram_text(body, budget) + footer
 
 
 def send_telegram(token, chat_id, message):
@@ -261,7 +294,6 @@ def main(argv=None):
             if dry_run:
                 print(f"\nFORMATED MESSAGE:\n{formatted_msg}\n")
                 count += 1
-                time.sleep(5)
                 continue
 
             result = send_telegram(
@@ -270,14 +302,14 @@ def main(argv=None):
             if not result:
                 print(f"[!] Telegram send failed for {entry['link']}; leaving unprocessed.")
                 count += 1
-                time.sleep(5)
+                time.sleep(ITEM_PAUSE_SECONDS)
                 continue
 
             processed.add(entry['link'])
             save_processed(processed)
             sent_this_run = True
             count += 1
-            time.sleep(5)
+            time.sleep(ITEM_PAUSE_SECONDS)
 
     if dry_run:
         print('\n[DONE] Dry run complete. No entries were saved as processed.')

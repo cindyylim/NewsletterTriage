@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from email.message import EmailMessage
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError
 
@@ -98,8 +99,29 @@ class FormatTelegramMessageTests(unittest.TestCase):
         self.assertIn('• first', message)
         self.assertIn('• second', message)
         self.assertIn('A &lt;tag&gt; &amp; ampersand', message)
-        self.assertIn("<a href='https://example.com/item'>Read more</a>", message)
+        self.assertIn('<a href="https://example.com/item">Read more</a>', message)
         self.assertNotIn('<script>', message)
+
+    def test_escapes_quotes_in_href(self):
+        message = main.format_telegram_message(
+            'AI',
+            'Title',
+            'Body',
+            'https://example.com/a?x="b"&c=d',
+        )
+        self.assertIn('href="https://example.com/a?x=&quot;b&quot;&amp;c=d"', message)
+
+    def test_truncates_to_telegram_limit(self):
+        message = main.format_telegram_message(
+            'Python',
+            'Title',
+            'x' * 8000,
+            'https://example.com/item',
+        )
+        self.assertLessEqual(len(message), main.TELEGRAM_MAX_LENGTH)
+        self.assertIn('…', message)
+        self.assertIn('<b>[Python] Title</b>', message)
+        self.assertIn('<a href="https://example.com/item">Read more</a>', message)
 
 
 class PromptTests(unittest.TestCase):
@@ -130,20 +152,29 @@ class ConfigTests(unittest.TestCase):
 class EnvTests(unittest.TestCase):
     def test_load_env_sets_values_from_file(self):
         previous = os.environ.pop('TELEGRAM_CHAT_ID', None)
-        cwd = os.getcwd()
         try:
             with tempfile.TemporaryDirectory() as tmp:
-                os.chdir(tmp)
-                with open('.env', 'w', encoding='utf-8') as handle:
-                    handle.write('TELEGRAM_CHAT_ID=12345\n# comment\n')
-                main.load_env()
+                env_path = Path(tmp) / '.env'
+                env_path.write_text('TELEGRAM_CHAT_ID=12345\n# comment\n', encoding='utf-8')
+                main.load_env(env_path)
                 self.assertEqual(os.environ['TELEGRAM_CHAT_ID'], '12345')
         finally:
-            os.chdir(cwd)
             if previous is None:
                 os.environ.pop('TELEGRAM_CHAT_ID', None)
             else:
                 os.environ['TELEGRAM_CHAT_ID'] = previous
+
+
+class PathTests(unittest.TestCase):
+    def test_load_config_uses_script_dir_not_cwd(self):
+        cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chdir(tmp)
+            try:
+                config = main.load_config()
+            finally:
+                os.chdir(cwd)
+        self.assertTrue(config['sources'])
 
 
 class ProcessedStoreTests(unittest.TestCase):
@@ -233,16 +264,16 @@ class GeminiTests(unittest.TestCase):
 
 class PipelineTests(unittest.TestCase):
     def setUp(self):
-        self.cwd = os.getcwd()
         self.tmp = tempfile.TemporaryDirectory()
-        os.chdir(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.base_dir_patcher = patch.object(main, 'BASE_DIR', Path(self.tmp.name))
+        self.base_dir_patcher.start()
+        self.addCleanup(self.base_dir_patcher.stop)
         self.env_backup = {
             key: os.environ.pop(key, None) for key in main.REQUIRED_ENV
         }
 
     def tearDown(self):
-        os.chdir(self.cwd)
-        self.tmp.cleanup()
         for key, value in self.env_backup.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -250,7 +281,7 @@ class PipelineTests(unittest.TestCase):
                 os.environ[key] = value
 
     def write_config(self, max_entries=1, summary_length='medium'):
-        with open('config.json', 'w', encoding='utf-8') as handle:
+        with open(main.BASE_DIR / 'config.json', 'w', encoding='utf-8') as handle:
             json.dump({
                 'sources': [{
                     'name': 'Test Weekly',
@@ -268,22 +299,26 @@ class PipelineTests(unittest.TestCase):
         os.environ['TELEGRAM_CHAT_ID'] = 'chat'
         os.environ['GEMINI_API_KEY'] = 'gemini'
 
+    def processed_path(self):
+        return main.BASE_DIR / 'processed_entries.json'
+
     def test_missing_keys_without_dry_run_exits_nonzero(self):
         code = main.main([])
         self.assertEqual(code, 1)
-        self.assertFalse(os.path.exists('processed_entries.json'))
+        self.assertFalse(self.processed_path().exists())
 
-    def test_dry_run_does_not_persist_or_call_side_effects(self):
+    def test_dry_run_does_not_persist_sleep_or_call_side_effects(self):
         self.write_config()
         with patch('main.fetch_rss', return_value=RSS_XML), \
              patch('main.call_gemini') as gemini, \
              patch('main.send_telegram') as telegram, \
-             patch('main.time.sleep'):
+             patch('main.time.sleep') as sleep:
             code = main.main(['--dry-run'])
         self.assertEqual(code, 0)
-        self.assertFalse(os.path.exists('processed_entries.json'))
+        self.assertFalse(self.processed_path().exists())
         gemini.assert_not_called()
         telegram.assert_not_called()
+        sleep.assert_not_called()
 
     def test_failed_send_does_not_persist(self):
         self.write_config()
@@ -294,7 +329,7 @@ class PipelineTests(unittest.TestCase):
              patch('main.time.sleep'):
             code = main.main([])
         self.assertEqual(code, 0)
-        self.assertFalse(os.path.exists('processed_entries.json'))
+        self.assertFalse(self.processed_path().exists())
 
     def test_successful_send_persists_immediately(self):
         self.write_config()
@@ -302,13 +337,14 @@ class PipelineTests(unittest.TestCase):
         with patch('main.fetch_rss', return_value=RSS_XML), \
              patch('main.call_gemini', return_value='takeaway') as gemini, \
              patch('main.send_telegram', return_value={'ok': True}), \
-             patch('main.time.sleep'):
+             patch('main.time.sleep') as sleep:
             code = main.main([])
         self.assertEqual(code, 0)
         stored = main.load_processed()
         self.assertEqual(stored, {'https://example.com/rss-item'})
         prompt = gemini.call_args.args[1]
         self.assertIn(main.SUMMARY_LENGTH_HINTS['medium'], prompt)
+        sleep.assert_called_once_with(main.ITEM_PAUSE_SECONDS)
 
 
 if __name__ == '__main__':
