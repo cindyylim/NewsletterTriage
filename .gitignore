@@ -1,2 +1,5 @@
 .env
 processed_entries.json
+__pycache__/
+*.pyc
+triage.log
