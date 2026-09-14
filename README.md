@@ -24,25 +24,6 @@ flowchart LR
   H --> I[processed_entries.json]
 ```
 
-Missing API keys are a hard error (exit 1) so a broken cron `.env` cannot look successful. Pass **`--dry-run`** to fetch and format without Gemini, Telegram, or persistence.
-
-## Design choices
-
-These are the parts a reviewer should look at in [`main.py`](main.py).
-
-| Decision | Why it matters |
-|---|---|
-| **Stdlib only** | `urllib`, `xml.etree`, `json`, `re`. No `requests` / `feedparser` lock-in; easy to drop on a VPS or cron host. |
-| **RSS 2.0 and Atom** | Real feeds are mixed. Parser looks up `item` and namespaced `entry`, including Atom `link href`. |
-| **308 redirect follow** | `urlopen` handles 301/302; several newsletter hosts return 308. Relative `Location` is resolved with `urljoin`. |
-| **Idempotent reruns** | Seen URLs live in `processed_entries.json` next to `main.py`, written atomically after each successful Telegram send (`ok: true`). A failed send is left unprocessed and retried next hour. |
-| **Per-source cap** | `max_entries_per_run` counts Gemini attempts as well as sends, so a failing model cannot walk the whole feed. |
-| **Retries and timeouts** | Gemini retries 429/500/503 and timeouts with backoff. HTTP calls use a 20s timeout. Dry-run does not sleep. |
-| **Explicit dry-run** | `--dry-run` scrapes without side effects. Missing secrets, bad config, all-feed failures, or a failed send exit `1` so cron can alert. |
-| **API key as header** | Gemini auth uses `x-goog-api-key`, not a query string, so keys are less likely to land in logs. |
-| **Telegram-safe HTML** | Title, body, and `href` go through `html.escape`; `**bold**` and list markers are converted afterward. Messages are clipped to Telegram’s 4096-character limit. |
-| **Secrets stay out of git** | `.env` does not override variables already in the environment. `.env` and the processed-id store are gitignored. |
-
 ## Setup
 
 ```bash
@@ -91,7 +72,7 @@ Sources and budget live in [`config.json`](config.json), not in code:
 
 ## Operations
 
-Hourly cron (no `cd` required — `config.json`, `.env`, and `processed_entries.json` are resolved from `main.py`’s directory):
+Hourly cron 
 
 ```cron
 0 * * * * /usr/bin/python3 /path/to/NewsletterTriage/main.py >> /path/to/NewsletterTriage/triage.log 2>&1
@@ -122,4 +103,3 @@ NewsletterTriage/
 └── README.md
 ```
 
-Single module, explicit I/O, no framework. The interesting code is the HTTP edge cases, the dry-run split, and the retry/dedupe path — not the file count.
